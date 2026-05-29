@@ -32,7 +32,7 @@ except ImportError:
 
 # 东八区时区（北京时间）
 CHINA_TZ = timezone(timedelta(hours=8))
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 from email.utils import parsedate_to_datetime
 
 # 元数据缓存配置（基于版本号的永久缓存）
@@ -2476,6 +2476,90 @@ class LanhuExtractor:
             "real-path": "/item/project/product"
         }
         self.client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=headers, follow_redirects=True)
+        self._playwright_instance = None
+        self._playwright_browser = None
+        self._playwright_context = None
+        self._playwright_page = None
+        self._playwright_page_url = None
+
+    async def _ensure_playwright_page(self, page_url: str | None = None):
+        """懒加载 Playwright 页面，后续复用同一浏览器上下文请求蓝湖受保护接口。"""
+        if self._playwright_instance is None:
+            self._playwright_instance = await async_playwright().start()
+            self._playwright_browser = await self._playwright_instance.chromium.launch(headless=True)
+            self._playwright_context = await self._playwright_browser.new_context()
+
+            cookies = []
+            for cookie_str in COOKIE.split('; '):
+                if '=' not in cookie_str:
+                    continue
+                name, value = cookie_str.split('=', 1)
+                cookies.append({
+                    'name': name,
+                    'value': value,
+                    'domain': '.lanhuapp.com',
+                    'path': '/'
+                })
+            if cookies:
+                await self._playwright_context.add_cookies(cookies)
+
+        if self._playwright_page is None:
+            self._playwright_page = await self._playwright_context.new_page()
+
+        target_url = page_url or f"{BASE_URL}/web/#/item/project/stage"
+        if self._playwright_page_url != target_url:
+            await self._playwright_page.goto(target_url, wait_until='domcontentloaded', timeout=30000)
+            self._playwright_page_url = target_url
+
+        return self._playwright_page
+
+    async def _fetch_json_via_browser(self, api_url: str, params: dict | None = None, page_url: str | None = None) -> dict:
+        """在浏览器上下文中通过 fetch + credentials=include 拉取蓝湖 JSON 接口。"""
+        page = await self._ensure_playwright_page(page_url)
+        request_url = api_url
+        if params:
+            request_url = f"{api_url}?{urlencode(params, doseq=True)}"
+
+        result = await page.evaluate(
+            """
+            async ({ requestUrl }) => {
+              const response = await fetch(requestUrl, {
+                credentials: 'include',
+                headers: {
+                  'Accept': 'application/json, text/plain, */*'
+                }
+              });
+              const text = await response.text();
+              return {
+                status: response.status,
+                text
+              };
+            }
+            """,
+            {"requestUrl": request_url}
+        )
+
+        if result["status"] >= 400:
+            raise Exception(f"Browser fetch failed: HTTP {result['status']} for {request_url}: {result['text'][:200]}")
+
+        try:
+            return json.loads(result["text"])
+        except json.JSONDecodeError as exc:
+            raise Exception(f"Browser fetch returned non-JSON response for {request_url}: {result['text'][:200]}") from exc
+
+    @staticmethod
+    def _build_design_page_url(project_id: str, image_id: str | None = None, team_id: str | None = None, source_url: str | None = None) -> str:
+        """构造设计稿浏览器上下文 URL，优先复用用户原始 detailDetach 链接。"""
+        if source_url and source_url.startswith("http"):
+            return source_url
+
+        params = [f"pid={project_id}"]
+        if team_id:
+            params.append(f"tid={team_id}")
+        if image_id:
+            params.append(f"image_id={image_id}")
+            return f"{BASE_URL}/web/#/item/project/detailDetach?{'&'.join(params)}&fromEditor=true&type=image"
+        return f"{BASE_URL}/web/#/item/project/stage?{'&'.join(params)}"
 
     def parse_url(self, url: str) -> dict:
         """
@@ -2518,8 +2602,8 @@ class LanhuExtractor:
                 params[key] = value
 
         # 提取必需参数
-        team_id = params.get('tid')
-        project_id = params.get('pid')
+        team_id = params.get('tid') or params.get('teamId')
+        project_id = params.get('pid') or params.get('project_id')
         doc_id = params.get('docId') or params.get('image_id')
         version_id = params.get('versionId')
 
@@ -3115,6 +3199,7 @@ class LanhuExtractor:
 
 
     async def get_design_slices_info(self, image_id: str, team_id: str = None, project_id: str = None,
+                                     page_url: str = None,
                                      include_metadata: bool = True) -> dict:
         """
         获取设计图的所有切图信息（仅返回元数据和下载地址，不下载文件）
@@ -3137,8 +3222,11 @@ class LanhuExtractor:
         }
         if team_id:
             params["team_id"] = team_id
-        response = await self.client.get(url, params=params)
-        data = response.json()
+        data = await self._fetch_json_via_browser(
+            url,
+            params=params,
+            page_url=self._build_design_page_url(project_id, image_id, team_id, page_url)
+        )
 
         if data['code'] != '00000':
             raise Exception(f"Failed to get design: {data['msg']}")
@@ -3505,7 +3593,9 @@ class LanhuExtractor:
             'slices': slices
         }
 
-    async def _get_version_id_by_image_id(self, project_id: str, team_id: str = None, image_id: str = None) -> str:
+    async def _get_version_id_by_image_id(
+        self, project_id: str, team_id: str = None, image_id: str = None, page_url: str = None
+    ) -> str:
         """通过 multi_info 按 image_id 获取 version_id（与 lanhu-html-converter-mcp 一致）"""
         url = f"{BASE_URL}/api/project/multi_info"
         params = {
@@ -3515,9 +3605,11 @@ class LanhuExtractor:
         }
         if team_id:
             params["team_id"] = team_id
-        response = await self.client.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
+        data = await self._fetch_json_via_browser(
+            url,
+            params=params,
+            page_url=self._build_design_page_url(project_id, image_id, team_id, page_url)
+        )
         if data.get("code") != "00000":
             raise Exception(f"multi_info 失败: {data.get('msg', '未知错误')}")
         images = (data.get("result") or {}).get("images") or []
@@ -3552,15 +3644,19 @@ class LanhuExtractor:
             schema_resp.raise_for_status()
             return schema_resp.json()
 
-    async def get_design_schema_json(self, image_id: str, team_id: str = None, project_id: str = None) -> dict:
+    async def get_design_schema_json(
+        self, image_id: str, team_id: str = None, project_id: str = None, page_url: str = None
+    ) -> dict:
         """
         获取设计图的 Schema JSON（用于转换为 HTML）。
         与 lanhu-html-converter-mcp 一致：multi_info -> version_id -> DDS store_schema_revise -> data_resource_url -> schema。
         """
-        version_id = await self._get_version_id_by_image_id(project_id, team_id, image_id)
+        version_id = await self._get_version_id_by_image_id(project_id, team_id, image_id, page_url)
         return await self._fetch_dds_schema(version_id)
 
-    async def get_sketch_json(self, image_id: str, team_id: str = None, project_id: str = None) -> dict:
+    async def get_sketch_json(
+        self, image_id: str, team_id: str = None, project_id: str = None, page_url: str = None
+    ) -> dict:
         """获取原始 Sketch JSON（含完整设计标注数据，用于 design token 提取）"""
         url = f"{BASE_URL}/api/project/image"
         params = {
@@ -3570,8 +3666,11 @@ class LanhuExtractor:
         }
         if team_id:
             params["team_id"] = team_id
-        response = await self.client.get(url, params=params)
-        data = response.json()
+        data = await self._fetch_json_via_browser(
+            url,
+            params=params,
+            page_url=self._build_design_page_url(project_id, image_id, team_id, page_url)
+        )
         if data['code'] != '00000':
             raise Exception(f"Failed to get design: {data['msg']}")
         result = data['result']
@@ -3583,6 +3682,14 @@ class LanhuExtractor:
     async def close(self):
         """关闭客户端"""
         await self.client.aclose()
+        if self._playwright_page is not None:
+            await self._playwright_page.close()
+        if self._playwright_context is not None:
+            await self._playwright_context.close()
+        if self._playwright_browser is not None:
+            await self._playwright_browser.close()
+        if self._playwright_instance is not None:
+            await self._playwright_instance.stop()
 
 
 def _format_page_design_info(design_info: dict, resource_dir: str = "") -> str:
@@ -5162,15 +5269,12 @@ async def _get_designs_internal(extractor: LanhuExtractor, url: str) -> dict:
     """内部函数：获取设计图列表"""
     # 解析URL获取参数
     params = extractor.parse_url(url)
-
-    # 构建获取设计图列表的API URL（team_id 可选）
-    api_url = (
-        f"https://lanhuapp.com/api/project/images"
-        f"?project_id={params['project_id']}"
+    design_page_url = extractor._build_design_page_url(
+        params['project_id'],
+        params.get('doc_id'),
+        params.get('team_id'),
+        url
     )
-    if params['team_id']:
-        api_url += f"&team_id={params['team_id']}"
-    api_url += f"&dds_status=1&position=1&show_cb_src=1&comment=1"
 
     sector_list = []
     image_sector_map = {}
@@ -5181,9 +5285,10 @@ async def _get_designs_internal(extractor: LanhuExtractor, url: str) -> dict:
             f"https://lanhuapp.com/api/project/project_sectors"
             f"?project_id={params['project_id']}"
         )
-        sector_response = await extractor.client.get(sector_api_url)
-        sector_response.raise_for_status()
-        sector_data = sector_response.json()
+        sector_data = await extractor._fetch_json_via_browser(
+            sector_api_url,
+            page_url=design_page_url
+        )
 
         if sector_data.get('code') == '00000':
             sector_list, image_sector_map = _normalize_design_sectors(
@@ -5195,9 +5300,61 @@ async def _get_designs_internal(extractor: LanhuExtractor, url: str) -> dict:
         sector_warning = str(e)
 
     # 发送请求
-    response = await extractor.client.get(api_url)
-    response.raise_for_status()
-    data = response.json()
+    try:
+        data = await extractor._fetch_json_via_browser(
+            "https://lanhuapp.com/api/project/images",
+            params={
+                "project_id": params['project_id'],
+                **({"team_id": params['team_id']} if params['team_id'] else {}),
+                "dds_status": 1,
+                "position": 1,
+                "show_cb_src": 1,
+                "comment": 1,
+            },
+            page_url=design_page_url
+        )
+    except Exception as exc:
+        if not params.get('doc_id'):
+            raise
+
+        single_design_data = await extractor._fetch_json_via_browser(
+            f"{BASE_URL}/api/project/image",
+            params={
+                "dds_status": 1,
+                "image_id": params['doc_id'],
+                "project_id": params['project_id'],
+                **({"team_id": params['team_id']} if params['team_id'] else {}),
+            },
+            page_url=design_page_url
+        )
+        if single_design_data.get('code') != '00000':
+            return {
+                'status': 'error',
+                'message': single_design_data.get('msg', f'Fallback project image failed: {exc}')
+            }
+
+        image = single_design_data.get('result') or {}
+        return {
+            'status': 'success',
+            'project_name': f"project_{params['project_id'][:8]}",
+            'total_sectors': 0,
+            'ungrouped_design_count': 1,
+            'sectors': [],
+            'total_designs': 1,
+            'designs': [{
+                'index': 1,
+                'id': image.get('id'),
+                'name': image.get('name'),
+                'width': image.get('width'),
+                'height': image.get('height'),
+                'url': image.get('url'),
+                'has_comment': image.get('has_comment', False),
+                'update_time': image.get('update_time'),
+                'sectors': [],
+            }],
+            'fallback_mode': 'single_image_from_detail_url',
+            'fallback_reason': str(exc),
+        }
 
     if data.get('code') != '00000':
         return {
@@ -5531,7 +5688,8 @@ async def lanhu_get_ai_analyze_design_result(
                 schema_json = await extractor.get_design_schema_json(
                     design['id'],
                     params.get('team_id'),
-                    params['project_id']
+                    params['project_id'],
+                    url
                 )
                 
                 # 转换为 HTML 并压缩（与 TS 端一致，减少 token）
@@ -5566,7 +5724,8 @@ async def lanhu_get_ai_analyze_design_result(
                 sketch_json = await extractor.get_sketch_json(
                     design['id'],
                     params.get('team_id'),
-                    params['project_id']
+                    params['project_id'],
+                    url
                 )
                 design_tokens = _extract_design_tokens(sketch_json)
 
@@ -5926,6 +6085,7 @@ async def lanhu_get_design_slices(
             image_id=target_design['id'],
             team_id=params.get('team_id'),
             project_id=params['project_id'],
+            page_url=url,
             include_metadata=include_metadata
         )
 
