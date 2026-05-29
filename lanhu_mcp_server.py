@@ -3197,6 +3197,220 @@ class LanhuExtractor:
             'android_xxxhdpi': make_url(js_round(one_x_w * 4), js_round(one_x_h * 4)),
         }
 
+    @staticmethod
+    def _safe_int(value, default: int = 0) -> int:
+        try:
+            if value is None or value == "":
+                return default
+            return int(round(float(value)))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _dedupe_slices(slices: list[dict]) -> list[dict]:
+        deduped = []
+        seen = set()
+        for item in slices:
+            key = (
+                item.get('id'),
+                item.get('download_url'),
+                item.get('layer_path'),
+                item.get('name'),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    def _build_generic_slice_info(
+        self,
+        *,
+        layer_id,
+        current_name: str,
+        layer_type: str,
+        download_url: str,
+        logical_w: float = 0,
+        logical_h: float = 0,
+        frame: dict | None = None,
+        parent_name: str = "",
+        current_path: str = "",
+        include_metadata: bool = False,
+        metadata: dict | None = None,
+        slice_scale: int = 2,
+        svg_url: str | None = None,
+        fmt: str | None = None,
+    ) -> dict:
+        size_str = (
+            f"{self._safe_int(logical_w)}x{self._safe_int(logical_h)}"
+            if logical_w and logical_h else "unknown"
+        )
+        slice_info = {
+            'id': layer_id,
+            'name': current_name or 'slice',
+            'type': layer_type or 'bitmap',
+            'download_url': download_url,
+            'size': size_str,
+            'format': fmt or ('png' if download_url and '.svg' not in download_url.lower() else 'svg'),
+        }
+        if svg_url and svg_url != download_url:
+            slice_info['svg_url'] = svg_url
+        if download_url and logical_w and logical_h and slice_info['format'] != 'svg':
+            slice_info['scale_urls'] = self._build_scale_urls(
+                download_url, logical_w, logical_h, slice_scale
+            )
+            slice_info['logical_size'] = {
+                'width': self._safe_int(logical_w),
+                'height': self._safe_int(logical_h),
+                'note': f'1x logical px; stored at {slice_scale}x = {self._safe_int(logical_w * slice_scale)}x{self._safe_int(logical_h * slice_scale)}px'
+            }
+        frame = frame or {}
+        x = frame.get('x', frame.get('left'))
+        y = frame.get('y', frame.get('top'))
+        if x is not None or y is not None:
+            slice_info['position'] = {
+                'x': self._safe_int(x),
+                'y': self._safe_int(y)
+            }
+        if parent_name:
+            slice_info['parent_name'] = parent_name
+        slice_info['layer_path'] = current_path or current_name or 'slice'
+        if include_metadata and metadata:
+            slice_info['metadata'] = metadata
+        return slice_info
+
+    def _extract_slices_from_dds_schema(
+        self,
+        schema: dict,
+        *,
+        include_metadata: bool,
+        slice_scale: int,
+    ) -> list[dict]:
+        slices = []
+
+        def visit(node, parent_name="", layer_path=""):
+            if isinstance(node, list):
+                for child in node:
+                    visit(child, parent_name, layer_path)
+                return
+            if not isinstance(node, dict):
+                return
+
+            current_name = (
+                node.get('name') or node.get('layerName') or node.get('title') or
+                node.get('label') or node.get('id') or 'slice'
+            )
+            has_explicit_name = any(
+                node.get(key) for key in ('name', 'layerName', 'title', 'label', 'id')
+            )
+            current_path = (
+                f"{layer_path}/{current_name}" if layer_path else str(current_name)
+            ) if has_explicit_name else layer_path
+            layer_type = node.get('type') or node.get('layerType') or node.get('nodeType') or 'schema-node'
+            frame = node.get('frame') or node.get('bounds') or node.get('rect') or node.get('box') or {}
+
+            metadata = {}
+            for field in ('fills', 'borders', 'strokes', 'opacity', 'rotation', 'textStyle', 'shadows', 'radius', 'cornerRadius'):
+                if field in node:
+                    metadata[field] = node[field]
+
+            candidates = []
+
+            def add_candidate(url, *, svg_url=None, logical_w=0, logical_h=0, source='schema'):
+                if not url or not isinstance(url, str) or not url.startswith('http'):
+                    return
+                fmt = 'svg' if (svg_url == url or url.lower().endswith('.svg')) else 'png'
+                candidates.append({
+                    'download_url': url,
+                    'svg_url': svg_url,
+                    'logical_w': logical_w,
+                    'logical_h': logical_h,
+                    'format': fmt,
+                    'source': source,
+                })
+
+            for key in ('image', 'ddsImage'):
+                image_dict = node.get(key)
+                if isinstance(image_dict, dict):
+                    size = image_dict.get('size') or {}
+                    add_candidate(
+                        image_dict.get('imageUrl') or image_dict.get('url'),
+                        svg_url=image_dict.get('svgUrl'),
+                        logical_w=size.get('width') or frame.get('width', 0),
+                        logical_h=size.get('height') or frame.get('height', 0),
+                        source=key,
+                    )
+                    add_candidate(
+                        image_dict.get('svgUrl'),
+                        svg_url=image_dict.get('svgUrl'),
+                        logical_w=size.get('width') or frame.get('width', 0),
+                        logical_h=size.get('height') or frame.get('height', 0),
+                        source=key,
+                    )
+
+            images_dict = node.get('images')
+            if isinstance(images_dict, dict):
+                png_url = (
+                    images_dict.get('png_xxxhd') or images_dict.get('png_xxhd') or
+                    images_dict.get('png_xhd') or images_dict.get('png_hd') or
+                    images_dict.get('png') or images_dict.get('url')
+                )
+                svg_url = images_dict.get('svg')
+                add_candidate(
+                    png_url or svg_url,
+                    svg_url=svg_url,
+                    logical_w=frame.get('width', node.get('width', 0)),
+                    logical_h=frame.get('height', node.get('height', 0)),
+                    source='images',
+                )
+
+            exportables = node.get('exportables') or node.get('exports') or node.get('exportAssets')
+            if isinstance(exportables, list):
+                for asset in exportables:
+                    if not isinstance(asset, dict):
+                        continue
+                    add_candidate(
+                        asset.get('imageUrl') or asset.get('url') or asset.get('downloadUrl'),
+                        svg_url=asset.get('svgUrl'),
+                        logical_w=asset.get('width') or frame.get('width', 0),
+                        logical_h=asset.get('height') or frame.get('height', 0),
+                        source='exportables',
+                    )
+
+            if candidates:
+                base_metadata = dict(metadata) if include_metadata and metadata else {}
+                if include_metadata:
+                    base_metadata['source'] = 'dds_schema'
+                for candidate in candidates:
+                    merged_metadata = dict(base_metadata) if include_metadata else None
+                    if include_metadata:
+                        merged_metadata['resource_source'] = candidate['source']
+                    slices.append(self._build_generic_slice_info(
+                        layer_id=node.get('id'),
+                        current_name=str(current_name),
+                        layer_type=str(layer_type),
+                        download_url=candidate['download_url'],
+                        logical_w=candidate['logical_w'],
+                        logical_h=candidate['logical_h'],
+                        frame=frame,
+                        parent_name=parent_name,
+                        current_path=current_path,
+                        include_metadata=include_metadata,
+                        metadata=merged_metadata,
+                        slice_scale=slice_scale,
+                        svg_url=candidate.get('svg_url'),
+                        fmt=candidate.get('format'),
+                    ))
+
+            for child_key in ('layers', 'children', 'nodes', 'items', 'elements'):
+                children = node.get(child_key)
+                if isinstance(children, list):
+                    for child in children:
+                        visit(child, str(current_name), current_path)
+
+        visit(schema)
+        return self._dedupe_slices(slices)
+
 
     async def get_design_slices_info(self, image_id: str, team_id: str = None, project_id: str = None,
                                      page_url: str = None,
@@ -3579,6 +3793,24 @@ class LanhuExtractor:
 
                 slices.append(slice_info)
                 existing_ids.add(lid)
+
+        # DDS schema 兜底：部分蓝湖项目的真实切图资源仅在 schema 中可见，
+        # json_url 对应的结构稿无法完整枚举这些资源。
+        try:
+            version_id = latest_version.get('id') or latest_version.get('version_id')
+            if version_id:
+                schema = await self._fetch_dds_schema(version_id)
+                schema_slices = self._extract_slices_from_dds_schema(
+                    schema,
+                    include_metadata=include_metadata,
+                    slice_scale=slice_scale,
+                )
+                if schema_slices:
+                    slices.extend(schema_slices)
+        except Exception:
+            pass
+
+        slices = self._dedupe_slices(slices)
 
         return {
             'design_id': image_id,
